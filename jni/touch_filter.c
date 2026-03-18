@@ -1,26 +1,15 @@
 /*
- * touch_filter.c - Himax HX83xxx ghost slot filter v2
+ * touch_filter.c - Himax HX83xxx ghost slot filter v3
  * Device: gta4lve (Unisoc T618)
  *
- * Root cause (confirmed from getevent log):
- *   Himax sends TOUCH_MAJOR/PRESSURE frames with no X/Y for slots that
- *   were never properly initialized with a position. These "ghost slots"
- *   cause games to read a stale last-known position (often the camera
- *   joystick area) and spin the camera uncontrollably.
+ * Root cause (confirmed from getevent):
+ *   Himax sends TOUCH_MAJOR/PRESSURE for slots that NEVER receive a
+ *   TRACKING_ID or X/Y. Since active flag never gets set for these
+ *   slots, v2's ghost check (active && !pos_ever_known) missed them.
  *
- *   NOTE: Himax ALSO sends pressure-only updates for REAL slots after
- *   the initial touch frame (normal behavior). We must NOT drop those.
- *
- * Fix:
- *   Track pos_ever_known per slot (set when first X+Y seen after
- *   tracking_id assigned, cleared on tracking_id = -1).
- *   Ghost = active slot + has_pressure this frame + pos_ever_known == 0
- *   Drop any frame containing a ghost slot.
- *
- * v2 changes vs v1:
- *   - Open with O_RDWR (required for EVIOCGRAB on some kernels)
- *   - EVIOCGRAB called AFTER uinput device is ready
- *   - Ghost detection uses pos_ever_known (persistent) not has_pos (per-frame)
+ * v3 fix:
+ *   Ghost = has_pressure this frame AND (tracking_id == -1 OR !pos_ever_known)
+ *   i.e. any slot sending pressure without being properly initialized.
  */
 
 #include <stdio.h>
@@ -37,9 +26,8 @@
 #define LOG_PATH    "/data/local/tmp/touch_filter.log"
 
 typedef struct {
-    int  tracking_id;
-    int  active;
-    int  pos_ever_known;  /* got X AND Y at least once since tracking_id set */
+    int  tracking_id;     /* -1 = never assigned */
+    int  pos_ever_known;  /* got X AND Y at least once for this tracking_id */
     int  has_pressure;    /* got pressure/major this frame */
 } Slot;
 
@@ -103,16 +91,14 @@ static int uinput_setup(int src_fd) {
 
 int main(void) {
     logf = fopen(LOG_PATH, "a");
-    log_msg("=== touch_filter v2 started (gta4lve Himax) ===");
+    log_msg("=== touch_filter v3 started (gta4lve Himax) ===");
 
-    /* O_RDWR required for EVIOCGRAB on some kernels */
     int src = open(INPUT_DEV, O_RDWR);
     if (src < 0) { log_msg("ERROR: cannot open event4"); return 1; }
 
     int dst = uinput_setup(src);
     if (dst < 0) { log_msg("ERROR: uinput setup failed"); return 1; }
 
-    /* Wait for uinput device to appear before grabbing */
     usleep(300000);
 
     if (ioctl(src, EVIOCGRAB, 1) < 0)
@@ -125,9 +111,7 @@ int main(void) {
     memset(slots, 0, sizeof(slots));
     for (int i = 0; i < MAX_SLOTS; i++) slots[i].tracking_id = -1;
 
-    /* per-frame X/Y seen flags to build pos_ever_known */
-    int frame_x[MAX_SLOTS];
-    int frame_y[MAX_SLOTS];
+    int frame_x[MAX_SLOTS], frame_y[MAX_SLOTS];
     memset(frame_x, 0, sizeof(frame_x));
     memset(frame_y, 0, sizeof(frame_y));
 
@@ -140,29 +124,30 @@ int main(void) {
                 cur_slot = (ev.value >= 0 && ev.value < MAX_SLOTS) ? ev.value : 0;
                 break;
             case ABS_MT_TRACKING_ID:
-                slots[cur_slot].tracking_id = ev.value;
                 if (ev.value == -1) {
-                    slots[cur_slot].active        = 0;
-                    slots[cur_slot].pos_ever_known = 0;
+                    slots[cur_slot].tracking_id    = -1;
+                    slots[cur_slot].pos_ever_known  = 0;
                 } else {
-                    slots[cur_slot].active = 1;
-                    /* pos_ever_known stays 0 until we see X AND Y */
+                    slots[cur_slot].tracking_id = ev.value;
+                    /* pos_ever_known reset until we see X AND Y */
+                    slots[cur_slot].pos_ever_known = 0;
                 }
                 break;
             case ABS_MT_POSITION_X:
                 frame_x[cur_slot] = 1;
-                if (frame_y[cur_slot])
+                if (frame_y[cur_slot] && slots[cur_slot].tracking_id != -1)
                     slots[cur_slot].pos_ever_known = 1;
                 break;
             case ABS_MT_POSITION_Y:
                 frame_y[cur_slot] = 1;
-                if (frame_x[cur_slot])
+                if (frame_x[cur_slot] && slots[cur_slot].tracking_id != -1)
                     slots[cur_slot].pos_ever_known = 1;
                 break;
             case ABS_MT_TOUCH_MAJOR:
             case ABS_MT_WIDTH_MAJOR:
             case ABS_MT_PRESSURE:
-                slots[cur_slot].has_pressure = 1;
+                if (ev.value > 0) /* ignore lift events (value=0) */
+                    slots[cur_slot].has_pressure = 1;
                 break;
             }
         }
@@ -171,11 +156,15 @@ int main(void) {
             pending[pending_n++] = ev;
 
         if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            /*
+             * Ghost = slot has pressure this frame BUT:
+             *   - never got a tracking_id  (tracking_id == -1), OR
+             *   - got tracking_id but position was never known
+             */
             int ghost = 0;
             for (int i = 0; i < MAX_SLOTS; i++) {
-                if (slots[i].active &&
-                    slots[i].has_pressure &&
-                    !slots[i].pos_ever_known) {
+                if (slots[i].has_pressure &&
+                    (slots[i].tracking_id == -1 || !slots[i].pos_ever_known)) {
                     ghost = 1;
                     break;
                 }
@@ -186,7 +175,6 @@ int main(void) {
                     write(dst, &pending[i], sizeof(pending[i]));
             }
 
-            /* reset per-frame flags */
             for (int i = 0; i < MAX_SLOTS; i++)
                 slots[i].has_pressure = 0;
             memset(frame_x, 0, sizeof(frame_x));

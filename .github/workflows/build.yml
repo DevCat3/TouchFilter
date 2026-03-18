@@ -20,11 +20,12 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: Compile touch_filter (arm64-v8a static)
+      - name: Compile touch_filter (arm64-v8a dynamic)
         run: |
           ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
             -O2 \
-            -static-pie \
+            -pie \
+            -fPIE \
             -o system/bin/touch_filter \
             jni/touch_filter.c
           file system/bin/touch_filter
