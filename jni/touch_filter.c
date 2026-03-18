@@ -1,11 +1,26 @@
 /*
- * touch_filter.c - Himax HX83xxx ghost slot filter
+ * touch_filter.c - Himax HX83xxx ghost slot filter v2
  * Device: gta4lve (Unisoc T618)
  *
- * Problem: SLOT 3 (and others) send TOUCH_MAJOR/PRESSURE updates
- *          with no X/Y — causing stale position to be used by games.
- * Fix:     Drop any SYN_REPORT frame where a slot updated pressure
- *          but sent no position in that frame.
+ * Root cause (confirmed from getevent log):
+ *   Himax sends TOUCH_MAJOR/PRESSURE frames with no X/Y for slots that
+ *   were never properly initialized with a position. These "ghost slots"
+ *   cause games to read a stale last-known position (often the camera
+ *   joystick area) and spin the camera uncontrollably.
+ *
+ *   NOTE: Himax ALSO sends pressure-only updates for REAL slots after
+ *   the initial touch frame (normal behavior). We must NOT drop those.
+ *
+ * Fix:
+ *   Track pos_ever_known per slot (set when first X+Y seen after
+ *   tracking_id assigned, cleared on tracking_id = -1).
+ *   Ghost = active slot + has_pressure this frame + pos_ever_known == 0
+ *   Drop any frame containing a ghost slot.
+ *
+ * v2 changes vs v1:
+ *   - Open with O_RDWR (required for EVIOCGRAB on some kernels)
+ *   - EVIOCGRAB called AFTER uinput device is ready
+ *   - Ghost detection uses pos_ever_known (persistent) not has_pos (per-frame)
  */
 
 #include <stdio.h>
@@ -17,24 +32,22 @@
 #include <linux/uinput.h>
 #include <sys/ioctl.h>
 
-#define MAX_SLOTS       10
-#define INPUT_DEV       "/dev/input/event4"
-#define LOG_PATH        "/data/local/tmp/touch_filter.log"
+#define MAX_SLOTS   10
+#define INPUT_DEV   "/dev/input/event4"
+#define LOG_PATH    "/data/local/tmp/touch_filter.log"
 
 typedef struct {
     int  tracking_id;
-    int  x, y;
-    int  has_pos;      /* got X or Y this frame */
-    int  has_pressure; /* got pressure/major this frame */
     int  active;
+    int  pos_ever_known;  /* got X AND Y at least once since tracking_id set */
+    int  has_pressure;    /* got pressure/major this frame */
 } Slot;
 
 static Slot slots[MAX_SLOTS];
 static int  cur_slot = 0;
 static FILE *logf    = NULL;
 
-/* pending events buffer for current frame */
-#define MAX_PENDING 256
+#define MAX_PENDING 512
 static struct input_event pending[MAX_PENDING];
 static int pending_n = 0;
 
@@ -46,7 +59,6 @@ static int uinput_setup(int src_fd) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("open uinput"); return -1; }
 
-    /* copy capabilities from source device */
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
     strncpy(uidev.name, "himax-touchscreen-filtered", UINPUT_MAX_NAME_SIZE - 1);
@@ -55,26 +67,22 @@ static int uinput_setup(int src_fd) {
     uidev.id.product = 0x5678;
     uidev.id.version = 1;
 
-    /* abs limits — read from real device */
     struct input_absinfo abs;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_POSITION_X), &abs);
-    uidev.absmin[ABS_MT_POSITION_X]  = abs.minimum;
-    uidev.absmax[ABS_MT_POSITION_X]  = abs.maximum;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs);
-    uidev.absmin[ABS_MT_POSITION_Y]  = abs.minimum;
-    uidev.absmax[ABS_MT_POSITION_Y]  = abs.maximum;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_SLOT), &abs);
-    uidev.absmin[ABS_MT_SLOT]        = abs.minimum;
-    uidev.absmax[ABS_MT_SLOT]        = abs.maximum;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_TRACKING_ID), &abs);
-    uidev.absmin[ABS_MT_TRACKING_ID] = abs.minimum;
-    uidev.absmax[ABS_MT_TRACKING_ID] = abs.maximum;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_TOUCH_MAJOR), &abs);
-    uidev.absmax[ABS_MT_TOUCH_MAJOR] = abs.maximum;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_WIDTH_MAJOR), &abs);
-    uidev.absmax[ABS_MT_WIDTH_MAJOR] = abs.maximum;
-    ioctl(src_fd, EVIOCGABS(ABS_MT_PRESSURE), &abs);
-    uidev.absmax[ABS_MT_PRESSURE]    = abs.maximum;
+#define COPY_ABS(code) \
+    if (ioctl(src_fd, EVIOCGABS(code), &abs) == 0) { \
+        uidev.absmin[code] = abs.minimum; \
+        uidev.absmax[code] = abs.maximum; \
+        uidev.absfuzz[code] = abs.fuzz; \
+        uidev.absflat[code] = abs.flat; \
+    }
+    COPY_ABS(ABS_MT_SLOT)
+    COPY_ABS(ABS_MT_TRACKING_ID)
+    COPY_ABS(ABS_MT_POSITION_X)
+    COPY_ABS(ABS_MT_POSITION_Y)
+    COPY_ABS(ABS_MT_TOUCH_MAJOR)
+    COPY_ABS(ABS_MT_WIDTH_MAJOR)
+    COPY_ABS(ABS_MT_PRESSURE)
+#undef COPY_ABS
 
     ioctl(fd, UI_SET_EVBIT,  EV_ABS);
     ioctl(fd, UI_SET_EVBIT,  EV_SYN);
@@ -93,35 +101,35 @@ static int uinput_setup(int src_fd) {
     return fd;
 }
 
-static void emit(int fd, __u16 type, __u16 code, __s32 val) {
-    struct input_event ev = {0};
-    ev.type  = type;
-    ev.code  = code;
-    ev.value = val;
-    write(fd, &ev, sizeof(ev));
-}
-
 int main(void) {
     logf = fopen(LOG_PATH, "a");
-    log_msg("=== touch_filter started (gta4lve Himax) ===");
+    log_msg("=== touch_filter v2 started (gta4lve Himax) ===");
 
-    int src = open(INPUT_DEV, O_RDONLY);
+    /* O_RDWR required for EVIOCGRAB on some kernels */
+    int src = open(INPUT_DEV, O_RDWR);
     if (src < 0) { log_msg("ERROR: cannot open event4"); return 1; }
-
-    /* grab the device — nobody else gets raw events */
-    if (ioctl(src, EVIOCGRAB, 1) < 0) {
-        log_msg("WARN: EVIOCGRAB failed — running without exclusive grab");
-    }
 
     int dst = uinput_setup(src);
     if (dst < 0) { log_msg("ERROR: uinput setup failed"); return 1; }
 
-    /* small delay for uinput device to appear */
-    usleep(200000);
-    log_msg("Filter running. Listening on event4...");
+    /* Wait for uinput device to appear before grabbing */
+    usleep(300000);
+
+    if (ioctl(src, EVIOCGRAB, 1) < 0)
+        log_msg("WARN: EVIOCGRAB failed");
+    else
+        log_msg("EVIOCGRAB OK");
+
+    log_msg("Filter running.");
 
     memset(slots, 0, sizeof(slots));
     for (int i = 0; i < MAX_SLOTS; i++) slots[i].tracking_id = -1;
+
+    /* per-frame X/Y seen flags to build pos_ever_known */
+    int frame_x[MAX_SLOTS];
+    int frame_y[MAX_SLOTS];
+    memset(frame_x, 0, sizeof(frame_x));
+    memset(frame_y, 0, sizeof(frame_y));
 
     struct input_event ev;
     while (read(src, &ev, sizeof(ev)) == sizeof(ev)) {
@@ -129,21 +137,27 @@ int main(void) {
         if (ev.type == EV_ABS) {
             switch (ev.code) {
             case ABS_MT_SLOT:
-                cur_slot = ev.value;
-                if (cur_slot < 0 || cur_slot >= MAX_SLOTS) cur_slot = 0;
+                cur_slot = (ev.value >= 0 && ev.value < MAX_SLOTS) ? ev.value : 0;
                 break;
             case ABS_MT_TRACKING_ID:
                 slots[cur_slot].tracking_id = ev.value;
-                if (ev.value == -1) slots[cur_slot].active = 0;
-                else                slots[cur_slot].active = 1;
+                if (ev.value == -1) {
+                    slots[cur_slot].active        = 0;
+                    slots[cur_slot].pos_ever_known = 0;
+                } else {
+                    slots[cur_slot].active = 1;
+                    /* pos_ever_known stays 0 until we see X AND Y */
+                }
                 break;
             case ABS_MT_POSITION_X:
-                slots[cur_slot].x       = ev.value;
-                slots[cur_slot].has_pos = 1;
+                frame_x[cur_slot] = 1;
+                if (frame_y[cur_slot])
+                    slots[cur_slot].pos_ever_known = 1;
                 break;
             case ABS_MT_POSITION_Y:
-                slots[cur_slot].y       = ev.value;
-                slots[cur_slot].has_pos = 1;
+                frame_y[cur_slot] = 1;
+                if (frame_x[cur_slot])
+                    slots[cur_slot].pos_ever_known = 1;
                 break;
             case ABS_MT_TOUCH_MAJOR:
             case ABS_MT_WIDTH_MAJOR:
@@ -153,35 +167,30 @@ int main(void) {
             }
         }
 
-        /* buffer event */
         if (pending_n < MAX_PENDING)
             pending[pending_n++] = ev;
 
         if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            /*
-             * Decision: does any slot have pressure-only update (no pos)?
-             * If yes → ghost slot detected → drop entire frame.
-             */
             int ghost = 0;
             for (int i = 0; i < MAX_SLOTS; i++) {
-                if (slots[i].has_pressure && !slots[i].has_pos && slots[i].active) {
+                if (slots[i].active &&
+                    slots[i].has_pressure &&
+                    !slots[i].pos_ever_known) {
                     ghost = 1;
                     break;
                 }
             }
 
             if (!ghost) {
-                /* clean frame — forward as-is */
                 for (int i = 0; i < pending_n; i++)
                     write(dst, &pending[i], sizeof(pending[i]));
             }
-            /* else: drop silently */
 
             /* reset per-frame flags */
-            for (int i = 0; i < MAX_SLOTS; i++) {
-                slots[i].has_pos      = 0;
+            for (int i = 0; i < MAX_SLOTS; i++)
                 slots[i].has_pressure = 0;
-            }
+            memset(frame_x, 0, sizeof(frame_x));
+            memset(frame_y, 0, sizeof(frame_y));
             pending_n = 0;
         }
     }
