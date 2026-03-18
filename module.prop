@@ -1,6 +1,6 @@
 id=TouchFilter
 name=Himax Ghost Slot Filter
-version=v1.0
-versionCode=1
-author=custom
-description=Filters ghost touch slots on Himax HX83xxx (gta4lve). Fixes camera spin in PUBG/Free Fire during multi-touch.
+version=v6.0
+versionCode=6
+author=DevCat3
+description=Fixes camera spin in PUBG/FreeFire during multi-touch on gta4lve (Himax HX83xxx). Uses state-reconstruction to eliminate ghost slots at the driver level.
