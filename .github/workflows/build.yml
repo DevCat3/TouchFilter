@@ -24,9 +24,7 @@ jobs:
         run: |
           ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
             -O2 \
-            -static \
-            -Wl,-z,max-page-size=65536 \
-            -Wl,-z,common-page-size=65536 \
+            -static-pie \
             -o system/bin/touch_filter \
             jni/touch_filter.c
           file system/bin/touch_filter
