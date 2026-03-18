@@ -1,12 +1,11 @@
 /*
- * touch_filter.c - Himax HX83xxx ghost slot filter v4
+ * touch_filter.c - Himax HX83xxx ghost slot filter v5
  * Device: gta4lve (Unisoc T618)
  *
- * Fixes vs v3:
- *   1. pos_ever_known: removed tracking_id check — Himax sends X/Y BEFORE
- *      TRACKING_ID in the same frame, so the old check always failed.
- *      Now: pos_ever_known set as soon as X AND Y seen in any frame.
- *   2. Added INPUT_PROP_DIRECT to uinput device — fixes phantom mouse cursor.
+ * v5: Instead of dropping entire frames containing ghost slots,
+ *     surgically cancel ghost slots (inject TRACKING_ID=-1) and
+ *     forward the rest of the frame intact.
+ *     This prevents valid finger movement data from being lost.
  */
 
 #include <stdio.h>
@@ -30,9 +29,10 @@
 #define LOG_PATH    "/data/local/tmp/touch_filter.log"
 
 typedef struct {
-    int  tracking_id;     /* -1 = not active */
-    int  pos_ever_known;  /* got X AND Y at least once for this tracking_id */
-    int  has_pressure;    /* pressure/major seen this frame */
+    int  tracking_id;
+    int  pos_ever_known;
+    int  has_pressure;
+    int  cancelled;      /* ghost-cancelled this session */
 } Slot;
 
 static Slot slots[MAX_SLOTS];
@@ -47,11 +47,19 @@ static void log_msg(const char *msg) {
     if (logf) { fputs(msg, logf); fputc('\n', logf); fflush(logf); }
 }
 
+static void emit(int fd, __u16 type, __u16 code, __s32 val) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type  = type;
+    ev.code  = code;
+    ev.value = val;
+    write(fd, &ev, sizeof(ev));
+}
+
 static int uinput_setup(int src_fd) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("open uinput"); return -1; }
 
-    /* INPUT_PROP_DIRECT = touchscreen, not pointer — prevents mouse cursor */
     ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
 
     struct uinput_user_dev uidev;
@@ -98,7 +106,7 @@ static int uinput_setup(int src_fd) {
 
 int main(void) {
     logf = fopen(LOG_PATH, "a");
-    log_msg("=== touch_filter v4 started (gta4lve Himax) ===");
+    log_msg("=== touch_filter v5 started (gta4lve Himax) ===");
 
     int src = open(INPUT_DEV, O_RDWR);
     if (src < 0) { log_msg("ERROR: cannot open event4"); return 1; }
@@ -130,34 +138,25 @@ int main(void) {
             case ABS_MT_SLOT:
                 cur_slot = (ev.value >= 0 && ev.value < MAX_SLOTS) ? ev.value : 0;
                 break;
-
             case ABS_MT_TRACKING_ID:
                 if (ev.value == -1) {
                     slots[cur_slot].tracking_id   = -1;
                     slots[cur_slot].pos_ever_known = 0;
+                    slots[cur_slot].cancelled      = 0;
                 } else {
                     slots[cur_slot].tracking_id = ev.value;
-                    /*
-                     * Don't reset pos_ever_known here — Himax may have already
-                     * sent X/Y before TRACKING_ID in this same frame.
-                     */
                 }
                 break;
-
             case ABS_MT_POSITION_X:
                 frame_x[cur_slot] = 1;
-                /* Set pos_ever_known as soon as we have both X and Y —
-                 * no tracking_id check: Himax sends X/Y before TRACKING_ID */
                 if (frame_y[cur_slot])
                     slots[cur_slot].pos_ever_known = 1;
                 break;
-
             case ABS_MT_POSITION_Y:
                 frame_y[cur_slot] = 1;
                 if (frame_x[cur_slot])
                     slots[cur_slot].pos_ever_known = 1;
                 break;
-
             case ABS_MT_TOUCH_MAJOR:
             case ABS_MT_WIDTH_MAJOR:
             case ABS_MT_PRESSURE:
@@ -172,21 +171,44 @@ int main(void) {
 
         if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
             /*
-             * Ghost = slot has pressure this frame AND no position ever known.
-             * Slots sending pressure-only updates for existing fingers are fine
-             * because pos_ever_known is already 1 from their first frame.
+             * For each ghost slot (pressure but no known position):
+             *   - If not already cancelled: inject SLOT + TRACKING_ID=-1
+             *     to explicitly kill it downstream, then mark cancelled.
+             *   - Strip its events from the pending buffer.
+             * Forward everything else normally.
              */
-            int ghost = 0;
+
+            /* First: inject cancellations for new ghost slots */
             for (int i = 0; i < MAX_SLOTS; i++) {
-                if (slots[i].has_pressure && !slots[i].pos_ever_known) {
-                    ghost = 1;
-                    break;
+                if (slots[i].has_pressure &&
+                    !slots[i].pos_ever_known &&
+                    !slots[i].cancelled) {
+                    emit(dst, EV_ABS, ABS_MT_SLOT, i);
+                    emit(dst, EV_ABS, ABS_MT_TRACKING_ID, -1);
+                    slots[i].cancelled = 1;
                 }
             }
 
-            if (!ghost) {
-                for (int i = 0; i < pending_n; i++)
-                    write(dst, &pending[i], sizeof(pending[i]));
+            /* Forward pending events, skipping events belonging to ghost slots */
+            int ghost_slot_cur = -1; /* tracks which slot we're writing for */
+            for (int i = 0; i < pending_n; i++) {
+                struct input_event *e = &pending[i];
+
+                if (e->type == EV_ABS && e->code == ABS_MT_SLOT) {
+                    int s = e->value;
+                    if (s >= 0 && s < MAX_SLOTS) ghost_slot_cur = s;
+                }
+
+                /* skip events for ghost slots */
+                if (e->type == EV_ABS && e->code != ABS_MT_SLOT &&
+                    e->code != EV_SYN) {
+                    if (ghost_slot_cur >= 0 &&
+                        slots[ghost_slot_cur].cancelled &&
+                        !slots[ghost_slot_cur].pos_ever_known)
+                        continue;
+                }
+
+                write(dst, e, sizeof(*e));
             }
 
             for (int i = 0; i < MAX_SLOTS; i++)
@@ -194,6 +216,7 @@ int main(void) {
             memset(frame_x, 0, sizeof(frame_x));
             memset(frame_y, 0, sizeof(frame_y));
             pending_n = 0;
+            ghost_slot_cur = -1;
         }
     }
 
