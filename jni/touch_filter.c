@@ -1,15 +1,12 @@
 /*
- * touch_filter.c - Himax HX83xxx ghost slot filter v3
+ * touch_filter.c - Himax HX83xxx ghost slot filter v4
  * Device: gta4lve (Unisoc T618)
  *
- * Root cause (confirmed from getevent):
- *   Himax sends TOUCH_MAJOR/PRESSURE for slots that NEVER receive a
- *   TRACKING_ID or X/Y. Since active flag never gets set for these
- *   slots, v2's ghost check (active && !pos_ever_known) missed them.
- *
- * v3 fix:
- *   Ghost = has_pressure this frame AND (tracking_id == -1 OR !pos_ever_known)
- *   i.e. any slot sending pressure without being properly initialized.
+ * Fixes vs v3:
+ *   1. pos_ever_known: removed tracking_id check — Himax sends X/Y BEFORE
+ *      TRACKING_ID in the same frame, so the old check always failed.
+ *      Now: pos_ever_known set as soon as X AND Y seen in any frame.
+ *   2. Added INPUT_PROP_DIRECT to uinput device — fixes phantom mouse cursor.
  */
 
 #include <stdio.h>
@@ -21,14 +18,21 @@
 #include <linux/uinput.h>
 #include <sys/ioctl.h>
 
+#ifndef INPUT_PROP_DIRECT
+#define INPUT_PROP_DIRECT 0x01
+#endif
+#ifndef UI_SET_PROPBIT
+#define UI_SET_PROPBIT _IOW(UINPUT_IOCTL_BASE, 110, int)
+#endif
+
 #define MAX_SLOTS   10
 #define INPUT_DEV   "/dev/input/event4"
 #define LOG_PATH    "/data/local/tmp/touch_filter.log"
 
 typedef struct {
-    int  tracking_id;     /* -1 = never assigned */
+    int  tracking_id;     /* -1 = not active */
     int  pos_ever_known;  /* got X AND Y at least once for this tracking_id */
-    int  has_pressure;    /* got pressure/major this frame */
+    int  has_pressure;    /* pressure/major seen this frame */
 } Slot;
 
 static Slot slots[MAX_SLOTS];
@@ -46,6 +50,9 @@ static void log_msg(const char *msg) {
 static int uinput_setup(int src_fd) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) { perror("open uinput"); return -1; }
+
+    /* INPUT_PROP_DIRECT = touchscreen, not pointer — prevents mouse cursor */
+    ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
 
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
@@ -91,7 +98,7 @@ static int uinput_setup(int src_fd) {
 
 int main(void) {
     logf = fopen(LOG_PATH, "a");
-    log_msg("=== touch_filter v3 started (gta4lve Himax) ===");
+    log_msg("=== touch_filter v4 started (gta4lve Himax) ===");
 
     int src = open(INPUT_DEV, O_RDWR);
     if (src < 0) { log_msg("ERROR: cannot open event4"); return 1; }
@@ -123,30 +130,38 @@ int main(void) {
             case ABS_MT_SLOT:
                 cur_slot = (ev.value >= 0 && ev.value < MAX_SLOTS) ? ev.value : 0;
                 break;
+
             case ABS_MT_TRACKING_ID:
                 if (ev.value == -1) {
-                    slots[cur_slot].tracking_id    = -1;
-                    slots[cur_slot].pos_ever_known  = 0;
+                    slots[cur_slot].tracking_id   = -1;
+                    slots[cur_slot].pos_ever_known = 0;
                 } else {
                     slots[cur_slot].tracking_id = ev.value;
-                    /* pos_ever_known reset until we see X AND Y */
-                    slots[cur_slot].pos_ever_known = 0;
+                    /*
+                     * Don't reset pos_ever_known here — Himax may have already
+                     * sent X/Y before TRACKING_ID in this same frame.
+                     */
                 }
                 break;
+
             case ABS_MT_POSITION_X:
                 frame_x[cur_slot] = 1;
-                if (frame_y[cur_slot] && slots[cur_slot].tracking_id != -1)
+                /* Set pos_ever_known as soon as we have both X and Y —
+                 * no tracking_id check: Himax sends X/Y before TRACKING_ID */
+                if (frame_y[cur_slot])
                     slots[cur_slot].pos_ever_known = 1;
                 break;
+
             case ABS_MT_POSITION_Y:
                 frame_y[cur_slot] = 1;
-                if (frame_x[cur_slot] && slots[cur_slot].tracking_id != -1)
+                if (frame_x[cur_slot])
                     slots[cur_slot].pos_ever_known = 1;
                 break;
+
             case ABS_MT_TOUCH_MAJOR:
             case ABS_MT_WIDTH_MAJOR:
             case ABS_MT_PRESSURE:
-                if (ev.value > 0) /* ignore lift events (value=0) */
+                if (ev.value > 0)
                     slots[cur_slot].has_pressure = 1;
                 break;
             }
@@ -157,14 +172,13 @@ int main(void) {
 
         if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
             /*
-             * Ghost = slot has pressure this frame BUT:
-             *   - never got a tracking_id  (tracking_id == -1), OR
-             *   - got tracking_id but position was never known
+             * Ghost = slot has pressure this frame AND no position ever known.
+             * Slots sending pressure-only updates for existing fingers are fine
+             * because pos_ever_known is already 1 from their first frame.
              */
             int ghost = 0;
             for (int i = 0; i < MAX_SLOTS; i++) {
-                if (slots[i].has_pressure &&
-                    (slots[i].tracking_id == -1 || !slots[i].pos_ever_known)) {
+                if (slots[i].has_pressure && !slots[i].pos_ever_known) {
                     ghost = 1;
                     break;
                 }
